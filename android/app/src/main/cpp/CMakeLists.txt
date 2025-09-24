@@ -1,11 +1,18 @@
 cmake_minimum_required(VERSION 3.22)
 project(llama_android LANGUAGES C CXX)
 
+# -------- toolchain / visibility defaults --------
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_VERBOSE_MAKEFILE ON)
+set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# ---- llama headers ----
+# keep exported symbols visible
+set(CMAKE_C_VISIBILITY_PRESET default)
+set(CMAKE_CXX_VISIBILITY_PRESET default)
+set(CMAKE_VISIBILITY_INLINES_HIDDEN OFF)
+
+# -------- headers: llama / ggml --------
 if (NOT DEFINED LLAMA_HEADERS_DIR)
   set(LLAMA_HEADERS_DIR ${CMAKE_CURRENT_LIST_DIR}/llama)
 endif()
@@ -16,9 +23,7 @@ else()
   message(FATAL_ERROR "llama.h not found in LLAMA_HEADERS_DIR=${LLAMA_HEADERS_DIR}")
 endif()
 
-# ---- ggml headers (needed by llama.h) ----
 if (NOT DEFINED GGML_HEADERS_DIR)
-  # try common locations relative to LLAMA_HEADERS_DIR
   set(_cand1 ${LLAMA_HEADERS_DIR}/../ggml/include)
   set(_cand2 ${LLAMA_HEADERS_DIR}/ggml/include)
   if (EXISTS ${_cand1}/ggml.h)
@@ -29,7 +34,7 @@ if (NOT DEFINED GGML_HEADERS_DIR)
 endif()
 
 if (NOT DEFINED GGML_HEADERS_DIR OR NOT EXISTS ${GGML_HEADERS_DIR}/ggml.h)
-  message(FATAL_ERROR "ggml.h not found. Set -DGGML_HEADERS_DIR=/abs/path/to/ggml/include")
+  message(FATAL_ERROR "ggml.h not found. Pass -DGGML_HEADERS_DIR=/abs/path/to/ggml/include")
 else()
   message(STATUS "Using ggml headers at: ${GGML_HEADERS_DIR}")
 endif()
@@ -37,25 +42,42 @@ endif()
 include_directories(${LLAMA_HEADERS_DIR})
 include_directories(${GGML_HEADERS_DIR})
 
-# ---- Prebuilt llama shared library in jniLibs/<abi> ----
+# -------- prebuilt llama shared lib from jniLibs/<abi> --------
 add_library(llama SHARED IMPORTED GLOBAL)
 set_target_properties(llama PROPERTIES
   IMPORTED_LOCATION ${CMAKE_CURRENT_LIST_DIR}/../jniLibs/${ANDROID_ABI}/libllama.so
 )
 
-# ---- Your JNI/FFI wrapper ----
+# -------- our JNI/FFI wrapper --------
 add_library(llama_android SHARED
   ${CMAKE_CURRENT_LIST_DIR}/llm_bridge.cpp
 )
 
+# make dlsym happy + prevent GC of our exported symbols
+target_link_options(llama_android PRIVATE
+  -Wl,--export-dynamic
+  -Wl,--undefined=llm_init
+  -Wl,--undefined=llm_infer
+  -Wl,--undefined=llm_dispose
+)
+
 # Android system libs
-find_library(log-lib log)
+find_library(log-lib     log)
 find_library(android-lib android)
+
+# STL runtime (pack libc++_shared.so into APK)
+find_library(cpp_shared  c++_shared REQUIRED)
 
 target_link_libraries(llama_android
   PRIVATE
-  llama
-  ${log-lib}
-  ${android-lib}
-  c++_shared
+    llama
+    ${log-lib}
+    ${android-lib}
+    ${cpp_shared}
+)
+
+set_target_properties(llama_android PROPERTIES
+  C_VISIBILITY_PRESET default
+  CXX_VISIBILITY_PRESET default
+  VISIBILITY_INLINES_HIDDEN OFF
 )
