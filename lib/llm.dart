@@ -1,55 +1,70 @@
+// lib/llm.dart
 import 'dart:async';
 import 'dart:convert';
 import 'dart:ffi';
 import 'dart:io';
 import 'package:ffi/ffi.dart';
 
-/// LLM wrapper with graceful fallback:
-/// - If native lib (libllama.so / static iOS) is available, uses FFI.
-/// - Otherwise runs a fast Dart-only mock so the app is RUNNABLE end-to-end.
 class LLM {
   DynamicLibrary? _lib;
   late final int Function(Pointer<Utf8>, int, int, int, int) _init;
   late final int Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, int) _infer;
   late final void Function() _dispose;
 
-  bool _ready = false;
   bool _mock = false;
+  String? lastError;
 
-  /// Expose mock/native state to UI
   bool get isMock => _mock;
 
-  Future<void> load({String libPath = 'libllama.so'}) async {
-    // Android expects libllama.so inside jniLibs/<abi> and dlopen by filename works.
+  Future<void> load({String libPath = 'libllama_android.so'}) async {
+    lastError = null;
+    DynamicLibrary? lib;
+
     if (Platform.isAndroid) {
+      // 1) try direct open
       try {
-        _lib = DynamicLibrary.open(libPath);
-      } catch (_) {
-        _lib = null;
+        lib = DynamicLibrary.open(libPath);
+      } catch (e1) {
+        // 2) fallback: if JNI already loaded it, symbols are in the process
+        try {
+          lib = DynamicLibrary.process();
+        } catch (e2) {
+          lastError = 'open("$libPath") failed: $e1; process() failed: $e2';
+        }
       }
     } else {
-      // If statically linked on iOS/macOS, we can resolve from the current process.
       try {
-        _lib = DynamicLibrary.process();
-      } catch (_) {
-        _lib = null;
+        lib = DynamicLibrary.process();
+      } catch (e) {
+        lastError = 'process() failed: $e';
       }
     }
 
-    if (_lib == null) {
-      _mock = true; // fallback so the app runs without native lib
+    if (lib == null) {
+      _mock = true;
       return;
     }
 
-    _init = _lib!
-        .lookup<NativeFunction<
-            Int32 Function(Pointer<Utf8>, Int32, Int32, Int32, Int32)>>('llm_init')
-        .asFunction();
-    _infer = _lib!
-        .lookup<NativeFunction<
-            Int32 Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int32)>>('llm_infer')
-        .asFunction();
-    _dispose = _lib!.lookup<NativeFunction<Void Function()>>('llm_dispose').asFunction();
+    try {
+      _init = lib
+          .lookup<NativeFunction<
+              Int32 Function(Pointer<Utf8>, Int32, Int32, Int32, Int32)>>('llm_init')
+          .asFunction();
+
+      _infer = lib
+          .lookup<NativeFunction<
+              Int32 Function(Pointer<Utf8>, Pointer<Utf8>, Pointer<Utf8>, Int32)>>('llm_infer')
+          .asFunction();
+
+      _dispose = lib
+          .lookup<NativeFunction<Void Function()>>('llm_dispose')
+          .asFunction();
+
+      _lib = lib;
+    } catch (e) {
+      lastError = 'symbol lookup failed: $e';
+      _mock = true;
+    }
   }
 
   Future<void> init({
@@ -59,41 +74,42 @@ class LLM {
     int threads = 4,
     int seed = 0,
   }) async {
-    if (_mock) {
-      _ready = true;
-      return;
-    }
+    if (_mock) return;
     final mp = modelPath.toNativeUtf8();
     final rc = _init(mp, ctx, gpuLayers, threads, seed);
     malloc.free(mp);
     if (rc != 0) {
       throw Exception('llm_init failed ($rc)');
     }
-    _ready = true;
   }
 
   Future<String> infer({
     required String prompt,
     required Map<String, dynamic> params,
   }) async {
-    if (!_ready) {
-      throw Exception('LLM not initialized');
-    }
-
     if (_mock) {
-      final answer = _shortAnswer(prompt);
-      return jsonEncode({"answer": answer, "mode": "mock"});
+      // minimal mock so UI works
+      final lower = prompt.toLowerCase();
+      String ans = 'This is a mock local response.';
+      if (lower.contains('what is flutter')) {
+        ans = 'Flutter is a UI toolkit by Google for building apps from one codebase.';
+      }
+      return jsonEncode({"answer": ans, "mode": "mock"});
     }
 
     final p = prompt.toNativeUtf8();
     final pj = const JsonEncoder().convert(params).toNativeUtf8();
-    const outSize = 1024 * 1024; // 1 MB
+    const outSize = 1024 * 1024;
     final outBuf = malloc.allocate<Utf8>(outSize);
+
     final rc = _infer(p, pj, outBuf, outSize);
     final out = outBuf.cast<Utf8>().toDartString();
-    malloc.free(p);
-    malloc.free(pj);
-    malloc.free(outBuf);
+
+    malloc
+      ..free(p)
+      ..free(pj)
+      ..free(outBuf);
+
     if (rc != 0) {
       throw Exception('llm_infer failed ($rc)');
     }
@@ -102,21 +118,8 @@ class LLM {
 
   void dispose() {
     if (_mock) return;
-    if (_ready) {
+    try {
       _dispose();
-      _ready = false;
-    }
+    } catch (_) {}
   }
-
-  // Very small mock so the app still works end-to-end without native lib.
-  String _shortAnswer(String prompt) {
-    final lower = prompt.toLowerCase();
-    if (lower.contains('what is flutter')) {
-      return 'Flutter is a UI toolkit by Google for building natively compiled apps from a single Dart codebase.';
-    }
-    if (lower.contains('classify')) {
-      return 'label: demo, confidence: 0.73';
-    }
-    return 'This is a mock local response. Add libllama.so (Android) or link libllama.a (iOS) for real LLM output.';
-    }
 }

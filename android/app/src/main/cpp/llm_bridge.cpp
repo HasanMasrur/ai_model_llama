@@ -1,8 +1,4 @@
-// llm_bridge.cpp
-// Minimal JNI + llama.cpp bridge for Android
-// - Clean structure, safe token-to-piece, simple JSON param parsing,
-// - Thread-safe (single global model/context guarded by mutex).
-
+// llm_bridge.cpp — updated for newer llama.cpp (vocab-based API), greedy decode
 #include <jni.h>
 #include <android/log.h>
 
@@ -11,35 +7,31 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <algorithm>   // std::min
 
-// llama.cpp headers (include path must point to your submodule)
 #include "llama.h"
 
-// ---------- logging ----------
 #ifndef LLOG_TAG
 #define LLOG_TAG "LLM_BRIDGE"
 #endif
-
 #define LLOGI(...) __android_log_print(ANDROID_LOG_INFO,  LLOG_TAG, __VA_ARGS__)
 #define LLOGW(...) __android_log_print(ANDROID_LOG_WARN,  LLOG_TAG, __VA_ARGS__)
 #define LLOGE(...) __android_log_print(ANDROID_LOG_ERROR, LLOG_TAG, __VA_ARGS__)
 
-// ---------- export visibility (Android/clang) ----------
 #if defined(__GNUC__)
   #define LLM_EXPORT __attribute__((visibility("default")))
 #else
   #define LLM_EXPORT
 #endif
 
-// ---------- globals ----------
 static std::mutex        g_mutex;
-static llama_model*      g_model = nullptr;
-static llama_context*    g_ctx   = nullptr;
+static llama_model*      g_model   = nullptr;
+static llama_context*    g_ctx     = nullptr;
+static int               g_threads = 4;
 
-// ---------- tiny JSON helpers (very naive) ----------
+// ---- tiny JSON helpers ----
 static double jgetd(const char* json, const char* key, double defv) {
     if (!json || !key) return defv;
-    // looks for:  "key": <number>
     std::string pat = std::string("\"") + key + "\"";
     const char* p = strstr(json, pat.c_str());
     if (!p) return defv;
@@ -47,24 +39,62 @@ static double jgetd(const char* json, const char* key, double defv) {
     if (!p) return defv;
     return atof(p + 1);
 }
-
 static int jgeti(const char* json, const char* key, int defi) {
-    return static_cast<int>(jgetd(json, key, static_cast<double>(defi)));
+    return (int) jgetd(json, key, (double)defi);
 }
 
-// ---------- lifecycle ----------
-extern "C" LLM_EXPORT
-int llm_init(const char* modelPath, int n_ctx, int n_gpu_layers, int n_threads, int seed) {
-    std::lock_guard<std::mutex> lock(g_mutex);
+// ---- helpers for newer API (vocab-based) ----
+static inline const llama_vocab* get_vocab() {
+    return llama_model_get_vocab(g_model);
+}
 
-    if (g_ctx) {
-        LLOGW("llm_init: context already initialized");
-        return 0;
-    }
-    if (!modelPath || !*modelPath) {
-        LLOGE("llm_init: invalid modelPath");
-        return -3;
-    }
+static inline std::vector<llama_token> tok_prompt(const std::string& s, bool add_special, bool parse_special) {
+    const llama_vocab* vocab = get_vocab();
+    const char* text = s.c_str();
+    const int32_t text_len = (int32_t)s.size();
+
+    // 1) required size
+    int32_t need = llama_tokenize(vocab, text, text_len, nullptr, 0, add_special, parse_special);
+    if (need < 0) need = -need;
+
+    std::vector<llama_token> out;
+    if (need <= 0) return out;
+    out.resize(need);
+
+    // 2) actual tokenize
+    int32_t wrote = llama_tokenize(vocab, text, text_len, out.data(), need, add_special, parse_special);
+    if (wrote < 0) wrote = -wrote;
+    if (wrote < need) out.resize(wrote);
+    return out;
+}
+
+static inline llama_token eos_token() {
+    return llama_vocab_eos(get_vocab());
+}
+
+static inline int vocab_size() {
+    return (int) llama_vocab_n_tokens(get_vocab());
+}
+
+static inline void append_piece(llama_token tok, std::string& out) {
+    char buf[512];
+    // lstrip = 0, special = false
+    const int n = llama_token_to_piece(get_vocab(), tok, buf, (int)sizeof(buf), /*lstrip*/0, /*special*/false);
+    if (n > 0) out.append(buf, (size_t)n);
+}
+
+static bool decode_tokens(const llama_token* data, int n, int& n_past) {
+    llama_batch batch = llama_batch_get_one((llama_token*)data, n);
+    if (llama_decode(g_ctx, batch) != 0) return false;
+    n_past += n;
+    return true;
+}
+
+extern "C" LLM_EXPORT
+int llm_init(const char* modelPath, int n_ctx, int n_gpu_layers, int n_threads, int /*seed*/) {
+    std::lock_guard<std::mutex> lock(g_mutex);
+    if (g_ctx) { LLOGW("llm_init: already initialized"); return 0; }
+    if (!modelPath || !*modelPath) { LLOGE("llm_init: invalid modelPath"); return -3; }
 
     llama_backend_init();
 
@@ -73,112 +103,89 @@ int llm_init(const char* modelPath, int n_ctx, int n_gpu_layers, int n_threads, 
     mparams.use_mmap     = true;
     mparams.use_mlock    = false;
 
-    g_model = llama_load_model_from_file(modelPath, mparams);
-    if (!g_model) {
-        LLOGE("llm_init: failed to load model: %s", modelPath);
-        return -1;
-    }
+    g_model = llama_model_load_from_file(modelPath, mparams);
+    if (!g_model) { LLOGE("llm_init: failed to load model: %s", modelPath); return -1; }
 
     llama_context_params cparams = llama_context_default_params();
     cparams.n_ctx     = (n_ctx > 0) ? n_ctx : 2048;
     cparams.n_batch   = 256;
-    cparams.seed      = seed;
     cparams.n_threads = (n_threads > 0) ? n_threads : 4;
+    g_threads         = cparams.n_threads;
 
-    g_ctx = llama_new_context_with_model(g_model, cparams);
+    g_ctx = llama_init_from_model(g_model, cparams);
     if (!g_ctx) {
         LLOGE("llm_init: failed to create context");
-        llama_free_model(g_model);
-        g_model = nullptr;
+        llama_model_free(g_model); g_model = nullptr;
         return -2;
     }
 
-    LLOGI("llm_init: success (ctx=%d, gpu_layers=%d, threads=%d)", cparams.n_ctx, n_gpu_layers, cparams.n_threads);
+    LLOGI("llm_init: ok (ctx=%d, gpu_layers=%d, threads=%d)", cparams.n_ctx, n_gpu_layers, g_threads);
     return 0;
 }
 
 extern "C" LLM_EXPORT
 int llm_infer(const char* prompt, const char* paramsJson, char* outBuf, int outBufSize) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (!g_ctx) {
-        LLOGE("llm_infer: context not initialized");
-        return -10;
-    }
-    if (!outBuf || outBufSize <= 1) {
-        LLOGE("llm_infer: invalid output buffer");
-        return -30;
-    }
+    if (!g_ctx) { LLOGE("llm_infer: ctx not init"); return -10; }
+    if (!outBuf || outBufSize <= 1) { LLOGE("llm_infer: bad outBuf"); return -30; }
 
-    // sampling params (defaults)
-    const float temperature    = paramsJson ? (float)jgetd(paramsJson, "temperature",    0.4) : 0.4f;
-    const float top_p          = paramsJson ? (float)jgetd(paramsJson, "top_p",          0.9) : 0.9f;
-    const int   top_k          = paramsJson ?        jgeti(paramsJson, "top_k",            40) : 40;
-    const float repeat_penalty = paramsJson ? (float)jgetd(paramsJson, "repeat_penalty", 1.1) : 1.1f;
-    const int   max_tokens     = paramsJson ?        jgeti(paramsJson, "max_tokens",     128) : 128;
-
-    llama_sampler* smpl = llama_sampler_chain_init(
-        llama_sampler_init_repetition_penalty(repeat_penalty, /* last_n */ 64, /* penalty_type */ 0, /* freq_penalty */ -1),
-        llama_sampler_init_top_k(top_k),
-        llama_sampler_init_top_p(top_p, /* min_keep */ 1),
-        llama_sampler_init_temp(temperature),
-        llama_sampler_init_dist(nullptr) // terminator
-    );
-
+    const int   max_tokens = paramsJson ? jgeti(paramsJson, "max_tokens", 128) : 128;
     std::string p = prompt ? prompt : "";
 
-    // tokenize (add_bos = true, parse_special = true)
-    std::vector<llama_token> tokens = llama_tokenize(g_ctx, p, /* add_special */ true, /* parse_special */ true);
+    // tokenize prompt
+    std::vector<llama_token> toks = tok_prompt(p, /*add_special*/true, /*parse_special*/true);
 
-    // evaluate prompt
-    if (llama_decode(g_ctx, llama_batch_get_one(tokens.data(), (int)tokens.size())) != 0) {
-        LLOGE("llama_decode(prompt) failed");
-        llama_sampler_free(smpl);
-        return -20;
+    int n_past = 0;
+    if (!toks.empty()) {
+        if (!decode_tokens(toks.data(), (int)toks.size(), n_past)) {
+            LLOGE("llama: decode(prompt) failed");
+            return -20;
+        }
     }
 
     std::string result;
-    result.reserve(2048);
+    result.reserve(4096);
 
     for (int i = 0; i < max_tokens; ++i) {
-        llama_token tok = llama_sampler_sample(smpl, g_ctx, /* idx */ -1);
-        llama_sampler_accept(smpl, tok);
+        const float* logits = llama_get_logits(g_ctx);
+        const int n_vocab   = vocab_size();
 
-        if (tok == llama_token_eos(g_ctx) || tok == -1) break;
+        // greedy pick
+        int best_id = 0;
+        float best_v = -1e30f;
+        for (int t = 0; t < n_vocab; ++t) {
+            float v = logits[t];
+            if (v > best_v) { best_v = v; best_id = t; }
+        }
 
-        // safe token -> piece (API expects buffer out)
-        char piece[512];
-        int  plen = llama_token_to_piece(g_ctx, tok, piece, (int)sizeof(piece));
-        if (plen > 0) result.append(piece, (size_t)plen);
+        const llama_token tok = (llama_token)best_id;
+        if (tok == eos_token() || tok == -1) break;
 
+        append_piece(tok, result);
         if ((int)result.size() >= outBufSize - 1) break;
 
-        // feed the sampled token back
-        llama_token tlist[1] = { tok };
-        if (llama_decode(g_ctx, llama_batch_get_one(tlist, 1)) != 0) {
-            LLOGW("llama_decode(step) failed, stopping early");
+        if (!decode_tokens(&tok, 1, n_past)) {
+            LLOGW("llama: decode(step) failed; stop");
             break;
         }
     }
 
-    // write to output (UTF-8)
     const int n = std::min((int)result.size(), outBufSize - 1);
     memcpy(outBuf, result.data(), (size_t)n);
     outBuf[n] = '\0';
-
-    llama_sampler_free(smpl);
     return 0;
 }
 
 extern "C" LLM_EXPORT
 void llm_dispose(void) {
     std::lock_guard<std::mutex> lock(g_mutex);
-    if (g_ctx)   { llama_free(g_ctx);        g_ctx   = nullptr; }
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
+    if (g_ctx)   { llama_free(g_ctx);         g_ctx   = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     llama_backend_free();
     LLOGI("llm_dispose: freed");
 }
 
-// ---------- simple JNI probe ----------
+// simple JNI probe
 extern "C"
 JNIEXPORT jstring JNICALL
 Java_com_example_llm_1model_NativeBridge_isAlive(JNIEnv* env, jclass) {

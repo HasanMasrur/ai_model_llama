@@ -1,8 +1,10 @@
+// lib/main.dart
 import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
+import 'package:flutter/services.dart'; // 👈 added
 import 'llm.dart';
 
 void main() {
@@ -17,6 +19,8 @@ class LLMApp extends StatefulWidget {
 }
 
 class _LLMAppState extends State<LLMApp> {
+  static const _ch = MethodChannel('llama/native'); // 👈 added
+
   final LLM _llm = LLM();
   final TextEditingController _prompt = TextEditingController(
     text: 'Return strictly JSON: {"answer":"<short>"}.\nQuestion: What is Flutter?',
@@ -28,7 +32,6 @@ class _LLMAppState extends State<LLMApp> {
   double _progress = 0.0;
   String? _modelPath;
 
-  // Default: TinyLlama 1.1B Chat Q4_K_M (~668MB)
   static const modelUrl =
       'https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf';
 
@@ -47,8 +50,17 @@ class _LLMAppState extends State<LLMApp> {
         await _downloadModel(Uri.parse(modelUrl), f);
       }
 
-      // Android: libllama.so must be in android/app/src/main/jniLibs/arm64-v8a/
-      await _llm.load(libPath: 'libllama.so');
+      // 👇 প্রথমে JNI দিয়ে lib লোড করাই (MainActivity -> NativeBridge)
+      try {
+        final ok = await _ch.invokeMethod<String>('isAlive');
+        // optional: debug print
+        // print('JNI isAlive: $ok');
+      } catch (_) {
+        // ignore; শুধু ট্রিগার করলেই চলবে
+      }
+
+      // ✅ এখন FFI লোড: wrapper lib
+      await _llm.load(libPath: 'libllama_android.so');
 
       await _llm.init(
         modelPath: _modelPath!,
@@ -59,7 +71,9 @@ class _LLMAppState extends State<LLMApp> {
 
       setState(() {
         _ready = true;
-        _status = _llm.isMock ? 'Ready (mock mode)' : 'Ready (native)';
+        _status = _llm.isMock
+            ? 'Ready (mock mode) — ${_llm.lastError ?? ""}'
+            : 'Ready (native)';
       });
     } catch (e) {
       setState(() => _status = 'Init error: $e');
@@ -104,10 +118,10 @@ class _LLMAppState extends State<LLMApp> {
       final raw = await _llm.infer(
         prompt: _prompt.text,
         params: {
-          "temperature": 0.4,
-          "top_p": 0.9,
-          "top_k": 40,
-          "repeat_penalty": 1.1,
+          "temperature": 0.0,
+          "top_p": 1.0,
+          "top_k": 0,
+          "repeat_penalty": 1.0,
           "max_tokens": 128
         },
       );
@@ -174,9 +188,7 @@ class _LLMAppState extends State<LLMApp> {
                     borderRadius: BorderRadius.circular(8),
                   ),
                   child: SelectableText(
-                    _output.isEmpty
-                        ? 'Output will appear here...'
-                        : _output,
+                    _output.isEmpty ? 'Output will appear here...' : _output,
                   ),
                 ),
               ),
