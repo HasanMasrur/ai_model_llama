@@ -1,0 +1,1 @@
+Place your llama.cpp bridge sources here if you want to build libllama.so yourself.

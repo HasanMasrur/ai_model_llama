@@ -1,0 +1,1 @@
+Models are downloaded at runtime to the app documents directory. This folder is optional during development.
